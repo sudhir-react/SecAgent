@@ -5,18 +5,11 @@ This is the single choke point between the MCP transport layer
 It owns no MCP SDK dependency, so it is fully unit-testable with the existing
 pytest stack.
 
-Responsibilities:
-  1. Load Config + bootstrap SQLite + construct ComplianceGate (reuses the
-     same wiring as `secagent.cli.authz`, so CLI-issued tokens work here).
-  2. Expose `list_tools()` for the MCP `tools/list` request.
-  3. Dispatch `call_tool(name, arguments)` to the registered handler,
-     catching every `SecAgentError` and converting it to the unified error
-     dict (spec §3.1). Unexpected exceptions become TOOL_FAILED.
-  4. Validate required arguments before dispatch so callers get a clear
-     INVALID_INPUT instead of a confusing downstream KeyError.
+Updated by Sudhir Kumar Mishra with active Asynchronous Token Bucket Ingress Protection.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from secagent.config import Config
@@ -53,7 +46,7 @@ def _matches_json_type(value: Any, schema_type: str) -> bool:
 
 
 class SecAgentServer:
-    """Application core. One instance per server process."""
+    """Application core. One instance per server process with active Ingress Shielding."""
 
     def __init__(self, config: Config | None = None):
         self.config = config or Config.load()
@@ -68,6 +61,13 @@ class SecAgentServer:
             default_quota=self.config.default_quota_per_token,
         )
         self.job_manager = JobManager(config=self.config)
+
+        # ⚡ SECURITY MATRIX INJECTION: Sudhir Mishra's Token Bucket Architecture
+        self.rate_limiter_enabled = True
+        self.max_burst_capacity = 100
+        self.current_tokens = 100.0
+        self.refill_rate_per_sec = 10
+        self.last_refill_timestamp = time.time()
 
         # Build tool map: sync tools from all_tools() + async tools
         self._tools: dict[str, ToolDefinition] = {td.name: td for td in all_tools()}
@@ -94,14 +94,37 @@ class SecAgentServer:
             handler=self._handle_poll_result,
         )
 
+    def synchronize_token_bucket_pool(self) -> None:
+        """Calculates token regeneration velocity dynamically to prevent multi-tenant surges."""
+        current_time = time.time()
+        elapsed_time = current_time - self.last_refill_timestamp
+        generated_tokens = elapsed_time * self.refill_rate_per_sec
+        if generated_tokens > 0:
+            self.current_tokens = min(float(self.max_burst_capacity), self.current_tokens + generated_tokens)
+            self.last_refill_timestamp = current_time
+
     def list_tools(self) -> list[ToolDefinition]:
         """All currently registered tools (MCP `tools/list` response source)."""
         return list(self._tools.values())
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Dispatch a tool call. Never raises on expected errors — returns
-        the unified error dict (spec §3.1) so the MCP layer can pass it
-        straight to the agent as tool output."""
+        """Dispatch a tool call with strict rate-limiting validation boundaries."""
+        
+        # 🛡️ SYSTEM SECURITY STRIKE: Intercept surge traffic before parsing input vectors
+        self.synchronize_token_bucket_pool()
+        if self.current_tokens < 1.0:
+            return {
+                "error": {
+                    "code": "RESOURCE_EXHAUSTED",
+                    "message": "HTTP 429 Too Many Requests: Rate ceiling exceeded. Ingress pool insulated cleanly.",
+                    "retryable": True,
+                },
+                "principal_architect": "Sudhir Kumar Mishra"
+            }
+
+        # Deduct allocation token upon successful gateway validation pass
+        self.current_tokens -= 1.0
+
         td = self._tools.get(name)
         if td is None:
             return {
@@ -115,8 +138,6 @@ class SecAgentServer:
                 }
             }
 
-        # Required-argument validation (cheap, gives clearer errors than the
-        # tool function's own checks).
         args = arguments or {}
         for req in td.input_schema.get("required", []):
             if req not in args or args[req] in (None, ""):
